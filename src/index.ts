@@ -23,6 +23,7 @@ dotenvConfig();
 
 const ConfigSchema = z.object({
   geminiApiKey: z.string().min(1, "Gemini API key is required"),
+  outputPath: z.string().optional(),
 });
 
 type Config = z.infer<typeof ConfigSchema>;
@@ -66,6 +67,20 @@ class NanoBananaMCP {
                 },
               },
               required: ["apiKey"],
+            },
+          },
+          {
+            name: "configure_output_path",
+            description: "Configure where generated/edited images are saved",
+            inputSchema: {
+              type: "object",
+              properties: {
+                outputPath: {
+                  type: "string",
+                  description: "Full path to directory where images should be saved (will be created if it doesn't exist)",
+                },
+              },
+              required: ["outputPath"],
             },
           },
           {
@@ -156,6 +171,9 @@ class NanoBananaMCP {
           case "configure_gemini_token":
             return await this.configureGeminiToken(request);
           
+          case "configure_output_path":
+            return await this.configureOutputPath(request);
+          
           case "generate_image":
             return await this.generateImage(request);
           
@@ -187,9 +205,9 @@ class NanoBananaMCP {
     const { apiKey } = request.params.arguments as { apiKey: string };
     
     try {
-      ConfigSchema.parse({ geminiApiKey: apiKey });
+      ConfigSchema.parse({ geminiApiKey: apiKey, outputPath: this.config?.outputPath });
       
-      this.config = { geminiApiKey: apiKey };
+      this.config = { geminiApiKey: apiKey, outputPath: this.config?.outputPath };
       this.genAI = new GoogleGenAI({ apiKey });
       this.configSource = 'config_file'; // Manual configuration via tool
       
@@ -208,6 +226,40 @@ class NanoBananaMCP {
         throw new McpError(ErrorCode.InvalidParams, `Invalid API key: ${error.errors[0]?.message}`);
       }
       throw error;
+    }
+  }
+
+  private async configureOutputPath(request: CallToolRequest): Promise<CallToolResult> {
+    const { outputPath } = request.params.arguments as { outputPath: string };
+    
+    try {
+      // Validate the path exists or can be created
+      const resolvedPath = path.resolve(outputPath);
+      
+      // Try to create the directory to test permissions
+      await fs.mkdir(resolvedPath, { recursive: true, mode: 0o755 });
+      
+      // Update config
+      this.config = {
+        geminiApiKey: this.config?.geminiApiKey || '',
+        outputPath: resolvedPath
+      };
+      
+      await this.saveConfig();
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Output path configured successfully!\n\n📁 Images will now be saved to: ${resolvedPath}\n\n💡 This directory has been created and tested for write permissions.`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Failed to configure output path: ${error instanceof Error ? error.message : String(error)}. Please ensure the path is writable.`
+      );
     }
   }
 
@@ -458,17 +510,32 @@ class NanoBananaMCP {
           sourceInfo = "\n📍 Source: Local configuration file (.nano-banana-config.json)\n💡 Consider using environment variables for better security.";
           break;
       }
+      
+      // Add output path info
+      const outputDir = this.getImagesDirectory();
+      sourceInfo += `\n\n📁 Images will be saved to: ${outputDir}`;
+      if (this.config?.outputPath) {
+        sourceInfo += " (custom path)";
+      } else {
+        sourceInfo += " (default path)";
+      }
+      sourceInfo += "\n💡 Use configure_output_path to change the save location.";
     } else {
       statusText = "❌ Gemini API token is not configured";
       sourceInfo = `
 
 📝 Configuration options (in priority order):
 1. 🥇 MCP client environment variables (Recommended)
-2. 🥈 System environment variable: GEMINI_API_KEY  
-3. 🥉 Use configure_gemini_token tool
+   - GEMINI_API_KEY: Your API key
+   - NANO_BANANA_OUTPUT_PATH: Custom output directory (optional)
+2. 🥈 System environment variables: GEMINI_API_KEY, NANO_BANANA_OUTPUT_PATH
+3. 🥉 Use configure_gemini_token and configure_output_path tools
 
 💡 For the most secure setup, add this to your MCP configuration:
-"env": { "GEMINI_API_KEY": "your-api-key-here" }`;
+"env": { 
+  "GEMINI_API_KEY": "your-api-key-here",
+  "NANO_BANANA_OUTPUT_PATH": "/path/to/your/images" 
+}`;
     }
     
     return {
@@ -574,6 +641,12 @@ class NanoBananaMCP {
   }
 
   private getImagesDirectory(): string {
+    // Use configured output path if available
+    if (this.config?.outputPath) {
+      return this.config.outputPath;
+    }
+    
+    // Fallback to smart defaults based on platform
     const platform = os.platform();
     
     if (platform === 'win32') {
@@ -604,9 +677,14 @@ class NanoBananaMCP {
   private async loadConfig(): Promise<void> {
     // Try to load from environment variable first
     const envApiKey = process.env.GEMINI_API_KEY;
+    const envOutputPath = process.env.NANO_BANANA_OUTPUT_PATH;
+    
     if (envApiKey) {
       try {
-        this.config = ConfigSchema.parse({ geminiApiKey: envApiKey });
+        this.config = ConfigSchema.parse({ 
+          geminiApiKey: envApiKey,
+          outputPath: envOutputPath
+        });
         this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
         this.configSource = 'environment';
         return;
