@@ -1,0 +1,22 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - geminiApiKey
+    properties:
+      geminiApiKey:
+        type: string
+        description: Gemini API key from Google AI Studio for image generation
+      outputPath:
+        type: string
+        description: Custom directory path where generated images will be saved (optional)
+  commandFunction: |
+    (config) => ({
+      command: "node",
+      args: ["dist/index.js"],
+      env: {
+        GEMINI_API_KEY: config.geminiApiKey,
+        OUTPUT_PATH: config.outputPath
+      }
+    })

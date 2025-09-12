@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(npm run typecheck:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "mcp__upstash-context-7-mcp__resolve-library-id",
+      "mcp__upstash-context-7-mcp__get-library-docs"
     ],
     "deny": [],
     "ask": []
