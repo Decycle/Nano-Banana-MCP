@@ -16,7 +16,6 @@ import { z } from 'zod'
 import fs from 'fs/promises'
 import path from 'path'
 import { config as dotenvConfig } from 'dotenv'
-import os from 'os'
 
 // Load environment variables
 dotenvConfig()
@@ -25,7 +24,7 @@ const ConfigSchema = z.object({
   geminiApiKey: z
     .string()
     .min(1, 'Gemini API key is required'),
-  outputPath: z.string().optional(),
+  workplacePath: z.string().optional(),
 })
 
 type Config = z.infer<typeof ConfigSchema>
@@ -79,22 +78,6 @@ class NanoBananaMCP {
               },
             },
             {
-              name: 'configure_output_path',
-              description:
-                'Configure where generated/edited images are saved',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  outputPath: {
-                    type: 'string',
-                    description:
-                      "Full path to directory where images should be saved (will be created if it doesn't exist)",
-                  },
-                },
-                required: ['outputPath'],
-              },
-            },
-            {
               name: 'generate_image',
               description:
                 'Generate a NEW image from text prompt. Use this ONLY when creating a completely new image, not when modifying an existing one.',
@@ -105,6 +88,11 @@ class NanoBananaMCP {
                     type: 'string',
                     description:
                       'Text prompt describing the NEW image to create from scratch',
+                  },
+                  relative_save_path: {
+                    type: 'string',
+                    description:
+                      'Optional relative path within the workplace directory to save the image (e.g., "subfolder/image.png")',
                   },
                 },
                 required: ['prompt'],
@@ -127,6 +115,11 @@ class NanoBananaMCP {
                     description:
                       'Text describing the modifications to make to the existing image',
                   },
+                  relative_save_path: {
+                    type: 'string',
+                    description:
+                      'Optional relative path within the workplace directory to save the edited image (e.g., "subfolder/edited.png")',
+                  },
                   referenceImages: {
                     type: 'array',
                     items: {
@@ -147,30 +140,6 @@ class NanoBananaMCP {
                 type: 'object',
                 properties: {},
                 additionalProperties: false,
-              },
-            },
-            {
-              name: 'continue_editing',
-              description:
-                'Continue editing the LAST image that was generated or edited in this session, optionally using additional reference images. Use this for iterative improvements, modifications, or changes to the most recent image. This automatically uses the previous image without needing a file path.',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  prompt: {
-                    type: 'string',
-                    description:
-                      "Text describing the modifications/changes/improvements to make to the last image (e.g., 'change the hat color to red', 'remove the background', 'add flowers')",
-                  },
-                  referenceImages: {
-                    type: 'array',
-                    items: {
-                      type: 'string',
-                    },
-                    description:
-                      'Optional array of file paths to additional reference images to use during editing (e.g., for style transfer, adding elements from other images, etc.)',
-                  },
-                },
-                required: ['prompt'],
               },
             },
             {
@@ -200,8 +169,6 @@ class NanoBananaMCP {
                 request
               )
 
-            case 'configure_output_path':
-              return await this.configureOutputPath(request)
 
             case 'generate_image':
               return await this.generateImage(request)
@@ -212,8 +179,6 @@ class NanoBananaMCP {
             case 'get_configuration_status':
               return await this.getConfigurationStatus()
 
-            case 'continue_editing':
-              return await this.continueEditing(request)
 
             case 'get_last_image_info':
               return await this.getLastImageInfo()
@@ -251,17 +216,15 @@ class NanoBananaMCP {
     try {
       ConfigSchema.parse({
         geminiApiKey: apiKey,
-        outputPath: this.config?.outputPath,
+        workplacePath: this.config?.workplacePath,
       })
 
       this.config = {
         geminiApiKey: apiKey,
-        outputPath: this.config?.outputPath,
+        workplacePath: this.config?.workplacePath,
       }
       this.genAI = new GoogleGenAI({ apiKey })
       this.configSource = 'config_file' // Manual configuration via tool
-
-      await this.saveConfig()
 
       return {
         content: [
@@ -282,50 +245,6 @@ class NanoBananaMCP {
     }
   }
 
-  private async configureOutputPath(
-    request: CallToolRequest
-  ): Promise<CallToolResult> {
-    const { outputPath } = request.params.arguments as {
-      outputPath: string
-    }
-
-    try {
-      // Validate the path exists or can be created
-      const resolvedPath = path.resolve(outputPath)
-
-      // Try to create the directory to test permissions
-      await fs.mkdir(resolvedPath, {
-        recursive: true,
-        mode: 0o755,
-      })
-
-      // Update config
-      this.config = {
-        geminiApiKey: this.config?.geminiApiKey || '',
-        outputPath: resolvedPath,
-      }
-
-      await this.saveConfig()
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `✅ Output path configured successfully!\n\n📁 Images will now be saved to: ${resolvedPath}\n\n💡 This directory has been created and tested for write permissions.`,
-          },
-        ],
-      }
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Failed to configure output path: ${
-          error instanceof Error
-            ? error.message
-            : String(error)
-        }. Please ensure the path is writable.`
-      )
-    }
-  }
 
   private async generateImage(
     request: CallToolRequest
@@ -337,8 +256,9 @@ class NanoBananaMCP {
       )
     }
 
-    const { prompt } = request.params.arguments as {
+    const { prompt, relative_save_path } = request.params.arguments as {
       prompt: string
+      relative_save_path?: string
     }
 
     try {
@@ -353,8 +273,11 @@ class NanoBananaMCP {
       const savedFiles: string[] = []
       let textContent = ''
 
-      // Get appropriate save directory based on OS
-      const imagesDir = this.getImagesDirectory()
+      // Get appropriate save directory - use workplace path or current directory
+      const workplaceDir = this.config?.workplacePath || process.cwd()
+      const imagesDir = relative_save_path 
+        ? path.join(workplaceDir, path.dirname(relative_save_path))
+        : workplaceDir
 
       // Create directory
       await fs.mkdir(imagesDir, {
@@ -375,13 +298,18 @@ class NanoBananaMCP {
 
           // Process image data
           if (part.inlineData?.data) {
-            const timestamp = new Date()
-              .toISOString()
-              .replace(/[:.]/g, '-')
-            const randomId = Math.random()
-              .toString(36)
-              .substring(2, 8)
-            const fileName = `generated-${timestamp}-${randomId}.png`
+            let fileName: string
+            if (relative_save_path) {
+              fileName = path.basename(relative_save_path)
+            } else {
+              const timestamp = new Date()
+                .toISOString()
+                .replace(/[:.]/g, '-')
+              const randomId = Math.random()
+                .toString(36)
+                .substring(2, 8)
+              fileName = `generated-${timestamp}-${randomId}.png`
+            }
             const filePath = path.join(imagesDir, fileName)
 
             const imageBuffer = Buffer.from(
@@ -454,10 +382,11 @@ class NanoBananaMCP {
       )
     }
 
-    const { imagePath, prompt, referenceImages } = request
+    const { imagePath, prompt, relative_save_path, referenceImages } = request
       .params.arguments as {
       imagePath: string
       prompt: string
+      relative_save_path?: string
       referenceImages?: string[]
     }
 
@@ -517,8 +446,11 @@ class NanoBananaMCP {
       const savedFiles: string[] = []
       let textContent = ''
 
-      // Get appropriate save directory
-      const imagesDir = this.getImagesDirectory()
+      // Get appropriate save directory - use workplace path or current directory
+      const workplaceDir = this.config?.workplacePath || process.cwd()
+      const imagesDir = relative_save_path 
+        ? path.join(workplaceDir, path.dirname(relative_save_path))
+        : workplaceDir
       await fs.mkdir(imagesDir, {
         recursive: true,
         mode: 0o755,
@@ -537,13 +469,18 @@ class NanoBananaMCP {
 
           if (part.inlineData) {
             // Save edited image
-            const timestamp = new Date()
-              .toISOString()
-              .replace(/[:.]/g, '-')
-            const randomId = Math.random()
-              .toString(36)
-              .substring(2, 8)
-            const fileName = `edited-${timestamp}-${randomId}.png`
+            let fileName: string
+            if (relative_save_path) {
+              fileName = path.basename(relative_save_path)
+            } else {
+              const timestamp = new Date()
+                .toISOString()
+                .replace(/[:.]/g, '-')
+              const randomId = Math.random()
+                .toString(36)
+                .substring(2, 8)
+              fileName = `edited-${timestamp}-${randomId}.png`
+            }
             const filePath = path.join(imagesDir, fileName)
 
             if (part.inlineData.data) {
@@ -636,31 +573,30 @@ class NanoBananaMCP {
           break
       }
 
-      // Add output path info
-      const outputDir = this.getImagesDirectory()
-      sourceInfo += `\n\n📁 Images will be saved to: ${outputDir}`
-      if (this.config?.outputPath) {
-        sourceInfo += ' (custom path)'
+      // Add workplace path info
+      const workplaceDir = this.config?.workplacePath || process.cwd()
+      sourceInfo += `\n\n📁 Images will be saved to: ${workplaceDir}`
+      if (this.config?.workplacePath) {
+        sourceInfo += ' (custom workplace path)'
       } else {
-        sourceInfo += ' (default path)'
+        sourceInfo += ' (current working directory)'
       }
       sourceInfo +=
-        '\n💡 Use configure_output_path to change the save location.'
+        '\n💡 Configure workplace_path via environment variable WORKPLACE_PATH.'
     } else {
       statusText = '❌ Gemini API token is not configured'
       sourceInfo = `
 
-📝 Configuration options (in priority order):
-1. 🥇 MCP client environment variables (Recommended)
-   - GEMINI_API_KEY: Your API key
-   - OUTPUT_PATH: Custom output directory (optional)
-2. 🥈 System environment variables: GEMINI_API_KEY, OUTPUT_PATH
-3. 🥉 Use configure_gemini_token and configure_output_path tools
+📝 Configuration options:
+1. 🥇 Environment variables (Recommended)
+   - GEMINI_API_KEY: Your API key (required)
+   - WORKPLACE_PATH: Custom workplace directory (optional)
+2. 🥈 Use configure_gemini_token tool
 
 💡 For the most secure setup, add this to your MCP configuration:
 "env": {
   "GEMINI_API_KEY": "your-api-key-here",
-  "OUTPUT_PATH": "/path/to/your/images"
+  "WORKPLACE_PATH": "/path/to/your/workplace"
 }`
     }
 
@@ -674,53 +610,6 @@ class NanoBananaMCP {
     }
   }
 
-  private async continueEditing(
-    request: CallToolRequest
-  ): Promise<CallToolResult> {
-    if (!this.ensureConfigured()) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'Gemini API token not configured. Use configure_gemini_token first.'
-      )
-    }
-
-    if (!this.lastImagePath) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'No previous image found. Please generate or edit an image first, then use continue_editing for subsequent edits.'
-      )
-    }
-
-    const { prompt, referenceImages } = request.params
-      .arguments as {
-      prompt: string
-      referenceImages?: string[]
-    }
-
-    // 检查最后的图片文件是否存在
-    try {
-      await fs.access(this.lastImagePath)
-    } catch {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Last image file not found at: ${this.lastImagePath}. Please generate a new image first.`
-      )
-    }
-
-    // Use editImage logic with lastImagePath
-
-    return await this.editImage({
-      method: 'tools/call',
-      params: {
-        name: 'edit_image',
-        arguments: {
-          imagePath: this.lastImagePath,
-          prompt: prompt,
-          referenceImages: referenceImages,
-        },
-      },
-    } as CallToolRequest)
-  }
 
   private async getLastImageInfo(): Promise<CallToolResult> {
     if (!this.lastImagePath) {
@@ -782,64 +671,18 @@ class NanoBananaMCP {
     }
   }
 
-  private getImagesDirectory(): string {
-    // Use configured output path if available
-    if (this.config?.outputPath) {
-      return this.config.outputPath
-    }
 
-    // Fallback to smart defaults based on platform
-    const platform = os.platform()
-
-    if (platform === 'win32') {
-      // Windows: Use Documents folder
-      const homeDir = os.homedir()
-      return path.join(
-        homeDir,
-        'Documents',
-        'nano-banana-images'
-      )
-    } else {
-      // macOS/Linux: Use current directory or home directory if in system paths
-      const cwd = process.cwd()
-      const homeDir = os.homedir()
-
-      // If in system directories, use home directory instead
-      if (
-        cwd.startsWith('/usr/') ||
-        cwd.startsWith('/opt/') ||
-        cwd.startsWith('/var/')
-      ) {
-        return path.join(homeDir, 'nano-banana-images')
-      }
-
-      return path.join(cwd, 'generated_imgs')
-    }
-  }
-
-  private async saveConfig(): Promise<void> {
-    if (this.config) {
-      const configPath = path.join(
-        process.cwd(),
-        '.nano-banana-config.json'
-      )
-      await fs.writeFile(
-        configPath,
-        JSON.stringify(this.config, null, 2)
-      )
-    }
-  }
 
   private async loadConfig(): Promise<void> {
     // Try to load from environment variable first
     const envApiKey = process.env.GEMINI_API_KEY
-    const envOutputPath = process.env.OUTPUT_PATH
+    const envWorkplacePath = process.env.WORKPLACE_PATH
 
     if (envApiKey) {
       try {
         this.config = ConfigSchema.parse({
           geminiApiKey: envApiKey,
-          outputPath: envOutputPath,
+          workplacePath: envWorkplacePath,
         })
         this.genAI = new GoogleGenAI({
           apiKey: this.config.geminiApiKey,
@@ -851,27 +694,7 @@ class NanoBananaMCP {
       }
     }
 
-    // Fallback to config file
-    try {
-      const configPath = path.join(
-        process.cwd(),
-        '.nano-banana-config.json'
-      )
-      const configData = await fs.readFile(
-        configPath,
-        'utf-8'
-      )
-      const parsedConfig = JSON.parse(configData)
-
-      this.config = ConfigSchema.parse(parsedConfig)
-      this.genAI = new GoogleGenAI({
-        apiKey: this.config.geminiApiKey,
-      })
-      this.configSource = 'config_file'
-    } catch {
-      // Config file doesn't exist or is invalid, that's okay
-      this.configSource = 'not_configured'
-    }
+    this.configSource = 'not_configured'
   }
 
   public async run(): Promise<void> {

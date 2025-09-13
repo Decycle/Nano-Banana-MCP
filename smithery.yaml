@@ -1,3 +1,4 @@
+runtime: "typescript"
 startCommand:
   type: stdio
   configSchema:
@@ -8,7 +9,7 @@ startCommand:
       geminiApiKey:
         type: string
         description: Gemini API key from Google AI Studio for image generation
-      outputPath:
+      workplacePath:
         type: string
         description: Custom directory path where generated images will be saved (optional)
   commandFunction: |
@@ -17,6 +18,6 @@ startCommand:
       args: ["dist/index.js"],
       env: {
         GEMINI_API_KEY: config.geminiApiKey,
-        OUTPUT_PATH: config.outputPath
+        WORKPLACE_PATH: config.workplacePath
       }
     })
